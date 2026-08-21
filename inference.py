@@ -14,6 +14,8 @@ import soundfile as sf
 import torchaudio
 import imageio
 import subprocess
+import shutil
+from pathlib import Path
 from denoiser import pretrained
 from denoiser.dsp import convert_audio
 
@@ -97,14 +99,15 @@ def create_mask_alpha(w, h, coordinate):
     
     return mask
 
-def process_audio(input_audio_path, output_audio_path):  
+def process_audio(input_audio_path, output_audio_path, device=None):
     wav,_ = librosa.load(input_audio_path, sr=16000)
     tmp_path = output_audio_path[:-4]+"_16000.wav"
     sf.write(tmp_path, wav, 16000)
 
-    model = pretrained.dns64().cuda()
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = pretrained.dns64().to(device)
     wav, sr = torchaudio.load(input_audio_path)
-    wav = convert_audio(wav.cuda(), sr, model.sample_rate, model.chin)
+    wav = convert_audio(wav.to(device), sr, model.sample_rate, model.chin)
 
     with torch.no_grad():
         denoised = model(wav[None])[0]
@@ -169,7 +172,12 @@ def inference_process(args: argparse.Namespace):
 
     temp_dir = os.path.join(save_path, "img")
     os.makedirs(temp_dir, exist_ok=True)
-    os.system(f"rm -r {temp_dir}/*")
+    # shutil is platform independent and also handles paths containing spaces.
+    for item in Path(temp_dir).iterdir():
+        if item.is_dir():
+            shutil.rmtree(item)
+        else:
+            item.unlink()
 
     # 3.2 prepare audio embeddings
     sample_rate = config.data.driving_audio.sample_rate
@@ -180,7 +188,7 @@ def inference_process(args: argparse.Namespace):
     audio_processor = load_audio_model(model_path=config.audio_model_path, device=device)
 
     audio_temp_path = os.path.join(save_path, "audio.wav")
-    process_audio(config.driving_audio, audio_temp_path)
+    process_audio(config.driving_audio, audio_temp_path, device=device)
 
     # 4. build modules
     sched_kwargs = OmegaConf.to_container(config.noise_scheduler_kwargs)
@@ -247,7 +255,8 @@ def inference_process(args: argparse.Namespace):
 
     video_stream = cv2.VideoCapture(args.source_video)
     
-    temp_video_path = config.output[:4] + "_no_audio.mp4"
+    output_path = Path(str(config.output))
+    temp_video_path = output_path.with_name(output_path.stem + "_no_audio.mp4")
     writer = imageio.get_writer(
     temp_video_path,
     fps=25,
@@ -317,8 +326,9 @@ def inference_process(args: argparse.Namespace):
 
                     source_image_pixels = torch.cat(source_image_pixels_list, dim=0)
                     mask_main = create_mask(mask_path, mask_512_path, len(frame_list))
-                    mask_main = mask_main.unsqueeze(0).to(device="cuda", dtype=weight_dtype)
-                    torch.cuda.empty_cache()
+                    mask_main = mask_main.unsqueeze(0).to(device=device, dtype=weight_dtype)
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
 
                     with torch.no_grad():
                         pipeline_output = pipeline(
@@ -333,7 +343,8 @@ def inference_process(args: argparse.Namespace):
                             generator=generator
                         )
 
-                    torch.cuda.empty_cache()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
 
                     images_out = pipeline_output.videos.squeeze(0).permute(1, 2, 3, 0).cpu().numpy()[:main_length]  # convert to [f, h, w, c]
                     images_out = np.clip(images_out * 255, 0, 255).astype(np.uint8)  # to [0, 255]
@@ -373,8 +384,11 @@ def inference_process(args: argparse.Namespace):
 
     writer.close()
 
-    command = f"ffmpeg -i {temp_video_path} -i {config.driving_audio} -map 0:v -map 1:a -c:v h264 -shortest -y {config.output} -loglevel quiet"
-    subprocess.run(command, shell=True, check=True, text=True)
+    subprocess.run([
+        "ffmpeg", "-i", str(temp_video_path), "-i", str(config.driving_audio),
+        "-map", "0:v", "-map", "1:a", "-c:v", "h264", "-shortest", "-y",
+        str(config.output), "-loglevel", "quiet"
+    ], check=True, text=True)
 
     # output_file = config.output
     # frames_path = os.path.join(temp_dir, f"image_%d.png")

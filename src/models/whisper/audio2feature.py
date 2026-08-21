@@ -3,13 +3,15 @@ from .whisper import load_model
 import numpy as np
 import time
 import sys
+import torch
 sys.path.append("..")
 
 class Audio2Feature():
     def __init__(self, 
                  whisper_model_type="tiny",
                  model_path="./models/whisper/tiny.pt",
-                 device="cuda"):
+                 device=None):
+        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.whisper_model_type = whisper_model_type
         self.model = load_model(model_path, device=device) #
 

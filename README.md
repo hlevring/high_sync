@@ -90,7 +90,7 @@ achieves state-of-the-art performance on both fronts.
 
 ### Environment
 
-    Ubuntu 20 or 22
+    Windows 10/11 (64-bit) or Ubuntu 20/22
 
 ### Download the Codes
 
@@ -107,8 +107,16 @@ achieves state-of-the-art performance on both fronts.
 
 ### Install ffmpeg
 ```bash
+# Windows (PowerShell): install the ffmpeg executable and add its `bin` folder to PATH.
+# With winget:
+winget install Gyan.FFmpeg.Shared
+# Ubuntu:
 apt-get install ffmpeg
 ```
+
+On Windows, run all commands from PowerShell and use `python` (or your virtual
+environment's Python). The project uses Python path utilities and does not
+require Bash, `rm`, or `sudo`.
 
 ### Download [pretrained weights](https://huggingface.co/saeed-5959/high_sync)
 
@@ -149,6 +157,20 @@ ffmpeg -i input.mp4 -r 25 out_25.mp4
 ```bash
   python -m inference --source_video "video_path.mp4" --driving_audio "audio_path.wav" --output "save_path.mp4"
 ```
+
+### Batch benchmark
+
+Put matching files in one folder, for example `001.mp4` + `001.wav`, then run
+the following command in PowerShell:
+
+```powershell
+python benchmark_inference.py --input_dir .\test_cases --output_dir .\output
+```
+
+Each pair produces an MP4 in `output`. The summary is written to
+`output\benchmark_results.csv`, including runtime, aligned audio duration,
+`runtime_audio_ratio` (runtime divided by audio duration), and peak reserved
+VRAM in GiB. On CPU-only systems the VRAM column is `0`.
 
 ### Dataset
 We preprocessed 3 public datasets and put their clean videos in these links : 

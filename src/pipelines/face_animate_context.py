@@ -302,7 +302,7 @@ class FaceAnimatePipeline(DiffusionPipeline):
 
         num_channels_latents = self.denoising_unet.in_channels
 
-        gt_encode = gt_encode.to(device="cuda", dtype=mask_main.dtype)
+        gt_encode = gt_encode.to(device=device, dtype=mask_main.dtype)
 
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,

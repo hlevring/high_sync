@@ -52,7 +52,8 @@ def save_videos_from_pil(pil_images, path, fps=8, audio_path=None):
     import av
 
     save_fmt = Path(path).suffix
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    parent = Path(path).parent
+    parent.mkdir(exist_ok=True, parents=True)
     width, height = pil_images[0].size
 
     if save_fmt == ".mp4":
@@ -250,7 +251,8 @@ def tensor_to_video_new(tensor, output_video_file, audio_path, fps=25):
     )  # to [0, 255]
 
     f, h, w, c = tensor.shape
-    temp_video_path = output_video_file[:4] + "_no_audio.mp4"
+    output_path = Path(output_video_file)
+    temp_video_path = output_path.with_name(output_path.stem + "_no_audio.mp4")
     video_writer = cv2.VideoWriter(temp_video_path, cv2.VideoWriter_fourcc(*'mp4v'), 25, (w, h))
 
     for t in tensor:
@@ -258,20 +260,27 @@ def tensor_to_video_new(tensor, output_video_file, audio_path, fps=25):
         video_writer.write(t)
     video_writer.release()
 
-    cmd = (f'ffmpeg -i "{temp_video_path}" -i "{audio_path}" '
-           f'-map 0:v -map 1:a -c:v h264 -shortest -y "{output_video_file}" -loglevel quiet')
-    os.system(cmd)
+    subprocess.run([
+        "ffmpeg", "-i", str(temp_video_path), "-i", str(audio_path),
+        "-map", "0:v", "-map", "1:a", "-c:v", "h264", "-shortest", "-y",
+        str(output_video_file), "-loglevel", "quiet"
+    ], check=True)
+    Path(temp_video_path).unlink(missing_ok=True)
 
 
 def save_video(frames_path, audio_path, output_path, frame_w, frame_h):
 
-    temp_video_path = output_path[:4] + "_no_audio.mp4"
+    output_path = Path(output_path)
+    temp_video_path = output_path.with_name(output_path.stem + "_no_audio.mp4")
 
-    command = f"ffmpeg -v error -hide_banner -framerate 25 -i {frames_path} -c:v libx264 -r 25 {temp_video_path} -y"
-    subprocess.run(command, shell=True, check=True, text=True)
+    subprocess.run(["ffmpeg", "-v", "error", "-hide_banner", "-framerate", "25",
+                    "-i", str(frames_path), "-c:v", "libx264", "-r", "25",
+                    str(temp_video_path), "-y"], check=True, text=True)
 
-    command = f"ffmpeg -i {temp_video_path} -i {audio_path} -map 0:v -map 1:a -c:v h264 -shortest -y {output_path} -loglevel quiet"
-    subprocess.run(command, shell=True, check=True, text=True)
+    subprocess.run(["ffmpeg", "-i", str(temp_video_path), "-i", str(audio_path),
+                    "-map", "0:v", "-map", "1:a", "-c:v", "h264", "-shortest",
+                    "-y", str(output_path), "-loglevel", "quiet"],
+                   check=True, text=True)
 
     return
 
