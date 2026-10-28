@@ -15,6 +15,9 @@ import torchaudio
 import imageio
 import subprocess
 import shutil
+import csv
+import time
+from datetime import datetime
 from pathlib import Path
 from denoiser import pretrained
 from denoiser.dsp import convert_audio
@@ -132,6 +135,47 @@ def mem_gpu():
     print(f"Cached: {cached / 1e9:.2f} GB")
 
 
+def prepare_inputs(source_video, driving_audio, save_path, fps):
+    """Resample the video to the model fps and the audio to 16 kHz mono wav."""
+    stream = cv2.VideoCapture(str(source_video))
+    source_fps = stream.get(cv2.CAP_PROP_FPS)
+    stream.release()
+
+    if abs(source_fps - fps) > 0.01:
+        resampled_video = os.path.join(save_path, f"source_{fps}fps.mp4")
+        print(f"resampling video from {source_fps:.2f} to {fps} fps")
+        subprocess.run([
+            "ffmpeg", "-y", "-loglevel", "error", "-i", str(source_video),
+            "-r", str(fps), "-an", "-c:v", "libx264", "-crf", "16", resampled_video
+        ], check=True)
+        source_video = resampled_video
+
+    audio_16k = os.path.join(save_path, "driving_audio_16k.wav")
+    subprocess.run([
+        "ffmpeg", "-y", "-loglevel", "error", "-i", str(driving_audio),
+        "-vn", "-ac", "1", "-ar", "16000", audio_16k
+    ], check=True)
+
+    return source_video, audio_16k
+
+
+def default_output_name(config):
+    """highsync_<audio>_<video>_s<steps>_cfg<cfg>_<dtype>.mp4"""
+    audio_name = Path(str(config.driving_audio)).stem
+    video_name = Path(str(config.source_video)).stem
+    return (f"highsync_{audio_name}_{video_name}"
+            f"_s{config.inference_steps}_cfg{config.cfg_scale:g}_{config.weight_dtype}.mp4")
+
+
+def log_run(csv_path, row):
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def inference_process(args: argparse.Namespace):
     """
     Perform inference processing.
@@ -142,6 +186,9 @@ def inference_process(args: argparse.Namespace):
     This function initializes the configuration for the inference process. It sets up the necessary
     modules and variables to prepare for the upcoming inference steps.
     """
+    t_start = time.perf_counter()
+    timings = {}
+
     # 1. init config
     cli_args = filter_non_none(vars(args))
     config = OmegaConf.load(args.config)
@@ -149,6 +196,14 @@ def inference_process(args: argparse.Namespace):
     save_path = config.save_path
     if not os.path.exists(save_path):
         os.makedirs(save_path)
+
+    if config.get("output") is None:
+        output_dir = config.get("output_dir") or "./output"
+        os.makedirs(output_dir, exist_ok=True)
+        config.output = os.path.join(output_dir, default_output_name(config))
+    else:
+        os.makedirs(os.path.dirname(os.path.abspath(str(config.output))), exist_ok=True)
+    print(f"output: {config.output}")
 
     # 2. runtime variables
     device = torch.device(
@@ -184,11 +239,17 @@ def inference_process(args: argparse.Namespace):
     assert sample_rate == 16000, "audio sample rate must be 16000"
     fps = config.data.export_video.fps
 
+    t0 = time.perf_counter()
+    source_video, audio_16k = prepare_inputs(
+        config.source_video, config.driving_audio, save_path, fps)
+
     ### load audio processor params
     audio_processor = load_audio_model(model_path=config.audio_model_path, device=device)
 
     audio_temp_path = os.path.join(save_path, "audio.wav")
-    process_audio(config.driving_audio, audio_temp_path, device=device)
+    process_audio(audio_16k, audio_temp_path, device=device)
+    timings["prepare_s"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
 
     # 4. build modules
     sched_kwargs = OmegaConf.to_container(config.noise_scheduler_kwargs)
@@ -248,12 +309,15 @@ def inference_process(args: argparse.Namespace):
 
 
     pipeline.to(device=device, dtype=weight_dtype)
+    timings["load_models_s"] = time.perf_counter() - t0
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
 
     image_processor = ImageProcessor(img_size)
 
     generator = torch.manual_seed(42)
 
-    video_stream = cv2.VideoCapture(args.source_video)
+    video_stream = cv2.VideoCapture(source_video)
     
     output_path = Path(str(config.output))
     temp_video_path = output_path.with_name(output_path.stem + "_no_audio.mp4")
@@ -280,7 +344,8 @@ def inference_process(args: argparse.Namespace):
     if video_length < audio_frame_num:
         audio_fea_final = audio_fea_final[:, :video_length, :, :]
 
-    times = video_length // config.inference_frames_num
+    times = int(np.ceil(video_length / config.inference_frames_num))
+    timings.update(face_detect_s=0.0, diffusion_s=0.0, composite_s=0.0)
 
     frames_video = []
     count_motion = 0
@@ -304,14 +369,16 @@ def inference_process(args: argparse.Namespace):
         
         if ((count_motion % config.inference_frames_num) == 0) or finish:
 
-            print(f"processing {count}/{times}")
-            source_image_pixels_all, bbox_all, frame_list_all = image_processor.preprocess_frames_jump(frames_video)            
+            print(f"processing {count + 1}/{times}")
+            t0 = time.perf_counter()
+            source_image_pixels_all, bbox_all, frame_list_all = image_processor.preprocess_frames_jump(frames_video)
+            timings["face_detect_s"] += time.perf_counter() - t0
 
             del frames_video
             
             for source_image_pixels_list, bbox_list, frame_list in zip(source_image_pixels_all, bbox_all, frame_list_all):
 
-                print(f"generating {count}/{times}")
+                print(f"generating {count + 1}/{times}")
 
                 if bbox_list[0]!=(0,0,0,0):
                     
@@ -330,6 +397,7 @@ def inference_process(args: argparse.Namespace):
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
 
+                    t0 = time.perf_counter()
                     with torch.no_grad():
                         pipeline_output = pipeline(
                             gt_encode=source_image_pixels,
@@ -345,6 +413,8 @@ def inference_process(args: argparse.Namespace):
 
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
+                    timings["diffusion_s"] += time.perf_counter() - t0
+                    t0 = time.perf_counter()
 
                     images_out = pipeline_output.videos.squeeze(0).permute(1, 2, 3, 0).cpu().numpy()[:main_length]  # convert to [f, h, w, c]
                     images_out = np.clip(images_out * 255, 0, 255).astype(np.uint8)  # to [0, 255]
@@ -368,6 +438,8 @@ def inference_process(args: argparse.Namespace):
                         
                         count_img += 1
 
+                    timings["composite_s"] += time.perf_counter() - t0
+
                 else:
                     for frame in frame_list:
                         path = os.path.join(temp_dir, f"image_{count_img}.png")
@@ -384,11 +456,34 @@ def inference_process(args: argparse.Namespace):
 
     writer.close()
 
+    t0 = time.perf_counter()
     subprocess.run([
         "ffmpeg", "-i", str(temp_video_path), "-i", str(config.driving_audio),
-        "-map", "0:v", "-map", "1:a", "-c:v", "h264", "-shortest", "-y",
-        str(config.output), "-loglevel", "quiet"
+        "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        "-shortest", "-y", str(config.output), "-loglevel", "error"
     ], check=True, text=True)
+    Path(temp_video_path).unlink(missing_ok=True)
+    timings["mux_s"] = time.perf_counter() - t0
+
+    total_s = time.perf_counter() - t_start
+    peak_vram_gib = torch.cuda.max_memory_reserved() / 1024**3 if device.type == "cuda" else 0.0
+    row = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "output": Path(str(config.output)).name,
+        "video": Path(str(config.source_video)).name,
+        "audio": Path(str(config.driving_audio)).name,
+        "frames": count_img,
+        "steps": config.inference_steps,
+        "cfg": config.cfg_scale,
+        "dtype": config.weight_dtype,
+        **{k: round(v, 1) for k, v in timings.items()},
+        "total_s": round(total_s, 1),
+        "s_per_frame": round(total_s / max(count_img, 1), 3),
+        "s_per_video_second": round(total_s / max(count_img / fps, 1e-6), 2),
+        "peak_vram_gib": round(peak_vram_gib, 2),
+    }
+    print("timings: " + ", ".join(f"{k}={v}" for k, v in row.items()))
+    log_run(os.path.join(os.path.dirname(os.path.abspath(str(config.output))), "highsync_runs.csv"), row)
 
     # output_file = config.output
     # frames_path = os.path.join(temp_dir, f"image_%d.png")
@@ -403,8 +498,12 @@ if __name__ == "__main__":
     parser.add_argument("-c", "--config", default="configs/inference/default.yaml")
     parser.add_argument("--source_video", type=str, required=False, help="source image")
     parser.add_argument("--driving_audio", type=str, required=False, help="driving audio")
-    parser.add_argument("--output", type=str, help="output video file name", default="./cache/output.mp4")
+    parser.add_argument("--output", type=str, help="output video file name (default: auto-named in --output_dir)")
+    parser.add_argument("--output_dir", type=str, help="directory for auto-named outputs", default="./output")
     parser.add_argument("--inference_frames_num", type=int, help="inference frames number", default=1500)
+    parser.add_argument("--inference_steps", type=int, help="override config inference_steps")
+    parser.add_argument("--cfg_scale", type=float, help="override config cfg_scale")
+    parser.add_argument("--weight_dtype", type=str, choices=["fp16", "bf16", "fp32"], help="override config weight_dtype")
 
 
     command_line_args = parser.parse_args()
