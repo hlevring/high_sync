@@ -39,6 +39,30 @@ from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange, repeat
 from tqdm import tqdm
 
+
+class ReferenceFeatureCache:
+    """Per-frame reference attention features; frames [0, split) live on the GPU, the rest in pinned CPU memory."""
+
+    def __init__(self, gpu_banks, cpu_banks, split, device):
+        self.gpu_banks = gpu_banks
+        self.cpu_banks = cpu_banks
+        self.split = split
+        self.device = device
+
+    def window(self, frame_ids):
+        lo, hi = int(frame_ids[0]), int(frame_ids[-1]) + 1
+        assert hi - lo == len(frame_ids), "context windows are expected to be contiguous"
+        split = self.split
+        out = []
+        for gpu, cpu in zip(self.gpu_banks, self.cpu_banks):
+            if hi <= split:
+                out.append(gpu[lo:hi])
+            elif lo >= split:
+                out.append(cpu[lo - split:hi - split].to(self.device, non_blocking=True))
+            else:
+                out.append(torch.cat([gpu[lo:split], cpu[:hi - split].to(self.device, non_blocking=True)]))
+        return out
+
 from src.pipelines.context import get_context_scheduler, modify_context_all
 from src.models.mutual_self_attention import ReferenceAttentionControl
 
@@ -216,6 +240,39 @@ class FaceAnimatePipeline(DiffusionPipeline):
             extra_step_kwargs["generator"] = generator
         return extra_step_kwargs
 
+    def prepare_reference_cache(self, ref_frames, writer, chunk, reserve_gb, device):
+        """Run the reference UNet once per frame and keep its attention features for all steps."""
+        num_frames = ref_frames.shape[0]
+        timestep = torch.zeros((), dtype=torch.long, device=device)
+        gpu_banks = cpu_banks = None
+        split = 0
+        for start in range(0, num_frames, chunk):
+            self.reference_unet(ref_frames[start:start + chunk], timestep,
+                                encoder_hidden_states=None, return_dict=False)
+            banks = writer.take_bank()
+
+            if gpu_banks is None:
+                per_frame = sum(b[0].numel() * b.element_size() for b in banks)
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                    free = torch.cuda.mem_get_info(device)[0]
+                    split = int(min(num_frames, max(0, free - reserve_gb * 1024**3) // per_frame))
+                gpu_banks = [torch.empty((split, *b.shape[1:]), dtype=b.dtype, device=device) for b in banks]
+                cpu_banks = [torch.empty((num_frames - split, *b.shape[1:]), dtype=b.dtype,
+                                         pin_memory=device.type == "cuda") for b in banks]
+                print(f"reference cache: {per_frame * num_frames / 1024**3:.2f} GiB for {num_frames} frames, "
+                      f"{split} on GPU, {num_frames - split} in CPU memory")
+
+            end = start + banks[0].shape[0]
+            for gpu, cpu, bank in zip(gpu_banks, cpu_banks, banks):
+                if start < split:
+                    gpu[start:min(end, split)] = bank[:min(end, split) - start]
+                if end > split:
+                    first = max(start, split)
+                    cpu[first - split:end - split].copy_(bank[first - start:])
+
+        return ReferenceFeatureCache(gpu_banks, cpu_banks, split, device)
+
     def decode_latents(self, latents):
         """
         Decode the latents to produce a video.
@@ -254,6 +311,11 @@ class FaceAnimatePipeline(DiffusionPipeline):
         video_length,
         num_inference_steps,
         guidance_scale,
+        audio_feature_ratio: float = 3.0,   # original: hardcoded 3.0
+        cfg_mode: str = "full",             # original: "full" (uncond audio zeroed)
+        ref_cache: bool = True,             # original: reference UNet per window and step
+        context_overlap: int = 0,           # original: 3
+        ref_cache_reserve_gb: float = 6.0,  # GPU memory kept free for denoising activations
         num_images_per_prompt=1,
         eta: float = 0.0,
         motion_scale: Optional[List[torch.Tensor]] = None,
@@ -294,7 +356,7 @@ class FaceAnimatePipeline(DiffusionPipeline):
             mode="read",
             batch_size=batch_size,
             fusion_blocks="full",
-            audio_feature_ratio=3.0,
+            audio_feature_ratio=audio_feature_ratio,
         )
 
         num_channels_latents = self.denoising_unet.in_channels
@@ -335,8 +397,14 @@ class FaceAnimatePipeline(DiffusionPipeline):
         context_schedule="uniform"
         context_frames=12
         context_stride=1
-        context_overlap=3
         context_batch_size=1
+
+        # The reference UNet sees clean frames at t=0 and is a 2D UNet, so its
+        # per-frame features are identical for every window and every step.
+        ref_frames = rearrange(gt_encode[0], "c f h w -> f c h w")
+        ref_bank = (self.prepare_reference_cache(ref_frames, reference_control_writer,
+                                                 context_frames, ref_cache_reserve_gb, device)
+                    if ref_cache else None)
 
         context_scheduler = get_context_scheduler(context_schedule)
 
@@ -403,15 +471,19 @@ class FaceAnimatePipeline(DiffusionPipeline):
                     #     return_dict=False,
                     # )
                     
-                    self.reference_unet(
-                        rearrange(gt_encode[0], "c f h w -> f c h w")[context[0]],
-                        torch.zeros_like(t),
-                        encoder_hidden_states=None,
-                        return_dict=False,
-                    )
-
-
-                    reference_control_reader.update(reference_control_writer, do_classifier_free_guidance=do_classifier_free_guidance)
+                    if ref_bank is not None:
+                        reference_control_reader.set_bank(
+                            ref_bank.window(context[0]),
+                            do_classifier_free_guidance=do_classifier_free_guidance)
+                    else:
+                        # original path: reference UNet on every window at every step
+                        self.reference_unet(
+                            ref_frames[context[0]],
+                            torch.zeros_like(t),
+                            encoder_hidden_states=None,
+                            return_dict=False,
+                        )
+                        reference_control_reader.update(reference_control_writer, do_classifier_free_guidance=do_classifier_free_guidance)
 
                     latent_model_input = (
                         torch.cat([latents[:, :, c] for c in context])
@@ -419,7 +491,9 @@ class FaceAnimatePipeline(DiffusionPipeline):
                         .repeat(2 if do_classifier_free_guidance else 1, 1, 1, 1, 1)
                     )
                     c_audio_latents = torch.cat([audio_tensor[:, c] for c in context]).to(device)
-                    audio_latents = torch.cat([torch.zeros_like(c_audio_latents), c_audio_latents], 0)
+                    # original: torch.zeros_like(c_audio_latents) only
+                    uncond_audio = c_audio_latents if cfg_mode == "reference" else torch.zeros_like(c_audio_latents)
+                    audio_latents = torch.cat([uncond_audio, c_audio_latents], 0)
 
                     latent_model_input = self.scheduler.scale_model_input(
                         latent_model_input, t
@@ -457,6 +531,9 @@ class FaceAnimatePipeline(DiffusionPipeline):
                     noise_pred = noise_pred_uncond + guidance_scale * (
                         noise_pred_text - noise_pred_uncond
                     )
+                else:
+                    # without CFG the overlapping window sums were never averaged originally
+                    noise_pred = noise_pred / counter
 
                 latents = self.scheduler.step(
                     noise_pred, t, latents, **extra_step_kwargs

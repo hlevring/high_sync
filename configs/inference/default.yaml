@@ -16,6 +16,15 @@ data:
 
 inference_steps: 20
 cfg_scale: 3.5
+# audio cross-attention strength; was hardcoded 3.0 in the pipeline (training value)
+audio_scale: 3.0
+# full (original): unconditional branch drops reference and zeroes audio
+# reference: unconditional branch drops only the reference image
+cfg_mode: full
+# on: reference UNet runs once per frame, identical output; original ran it per window and step
+ref_cache: "on"
+# frames shared by neighbouring 12-frame windows; original was hardcoded 3
+context_overlap: 0
 
 denoising_unet_path: "./pretrained_weights/denoising_unet-500.pth"
 reference_unet_path: "./pretrained_weights/reference_unet-500.pth"

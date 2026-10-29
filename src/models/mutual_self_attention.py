@@ -311,6 +311,28 @@ class ReferenceAttentionControl:
                 else:
                     r.bank = [v.clone().to(dtype) for v in w.bank]
 
+    def _sorted_attn_modules(self, block_types):
+        """Same block selection and ordering as update(), so writer and reader blocks pair up."""
+        if self.fusion_blocks == "midup":
+            candidates = torch_dfs(self.unet.mid_block) + torch_dfs(self.unet.up_blocks)
+        else:
+            candidates = torch_dfs(self.unet)
+        modules = [m for m in candidates if isinstance(m, block_types)]
+        return sorted(modules, key=lambda x: -x.norm1.normalized_shape[0])
+
+    def take_bank(self):
+        """Writer side: pop the per-frame features of the last forward pass, one tensor per block."""
+        banks = []
+        for module in self._sorted_attn_modules(BasicTransformerBlock):
+            banks.append(module.bank[0])
+            module.bank.clear()
+        return banks
+
+    def set_bank(self, banks, do_classifier_free_guidance=False, dtype=torch.float16):
+        """Reader side: equivalent of update() with precomputed writer features."""
+        for r, v in zip(self._sorted_attn_modules(TemporalBasicTransformerBlock), banks):
+            r.bank = [torch.cat([v, v]).to(dtype) if do_classifier_free_guidance else v.to(dtype)]
+
     def clear(self):
         if self.reference_attn:
             if self.fusion_blocks == "midup":

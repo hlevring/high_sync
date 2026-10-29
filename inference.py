@@ -136,7 +136,8 @@ def mem_gpu():
 
 
 def prepare_inputs(source_video, driving_audio, save_path, fps):
-    """Resample the video to the model fps and the audio to 16 kHz mono wav."""
+    """Resample the video to the model fps and the audio to 16 kHz mono wav.
+    Originally both had to be converted by hand before running."""
     stream = cv2.VideoCapture(str(source_video))
     source_fps = stream.get(cv2.CAP_PROP_FPS)
     stream.release()
@@ -160,20 +161,29 @@ def prepare_inputs(source_video, driving_audio, save_path, fps):
 
 
 def default_output_name(config):
-    """highsync_<audio>_<video>_s<steps>_cfg<cfg>_<dtype>.mp4"""
+    """highsync_<audio>_<video>_s<steps>_cfg<cfg>_as<audio_scale>_<dtype>.mp4"""
     audio_name = Path(str(config.driving_audio)).stem
     video_name = Path(str(config.source_video)).stem
     return (f"highsync_{audio_name}_{video_name}"
-            f"_s{config.inference_steps}_cfg{config.cfg_scale:g}_{config.weight_dtype}.mp4")
+            f"_s{config.inference_steps}_cfg{config.cfg_scale:g}"
+            f"_as{config.audio_scale:g}"
+            f"{'_cfgref' if config.cfg_mode == 'reference' else ''}"
+            f"{f'_ov{config.context_overlap}' if config.context_overlap != 0 else ''}"
+            f"_{config.weight_dtype}.mp4")
 
 
 def log_run(csv_path, row):
-    write_header = not os.path.exists(csv_path)
-    with open(csv_path, "a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+    rows, fieldnames = [], list(row.keys())
+    if os.path.exists(csv_path):
+        with open(csv_path, newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+            fieldnames += [f for f in (reader.fieldnames or []) if f not in fieldnames]
+    rows.append(row)
+    with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def inference_process(args: argparse.Namespace):
@@ -408,6 +418,10 @@ def inference_process(args: argparse.Namespace):
                             video_length=len(source_image_pixels_list),
                             num_inference_steps=config.inference_steps,
                             guidance_scale=config.cfg_scale,
+                            audio_feature_ratio=config.audio_scale,
+                            cfg_mode=config.cfg_mode,
+                            ref_cache=config.ref_cache == "on",
+                            context_overlap=config.context_overlap,
                             generator=generator
                         )
 
@@ -457,6 +471,7 @@ def inference_process(args: argparse.Namespace):
     writer.close()
 
     t0 = time.perf_counter()
+    # original: re-encoded with -c:v h264; copy keeps the CRF 18 stream from the writer
     subprocess.run([
         "ffmpeg", "-i", str(temp_video_path), "-i", str(config.driving_audio),
         "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
@@ -475,6 +490,10 @@ def inference_process(args: argparse.Namespace):
         "frames": count_img,
         "steps": config.inference_steps,
         "cfg": config.cfg_scale,
+        "audio_scale": config.audio_scale,
+        "cfg_mode": config.cfg_mode,
+        "ref_cache": config.ref_cache,
+        "context_overlap": config.context_overlap,
         "dtype": config.weight_dtype,
         **{k: round(v, 1) for k, v in timings.items()},
         "total_s": round(total_s, 1),
@@ -503,6 +522,16 @@ if __name__ == "__main__":
     parser.add_argument("--inference_frames_num", type=int, help="inference frames number", default=1500)
     parser.add_argument("--inference_steps", type=int, help="override config inference_steps")
     parser.add_argument("--cfg_scale", type=float, help="override config cfg_scale")
+    parser.add_argument("--audio_scale", type=float,
+                        help="strength of the audio cross-attention (original: hardcoded 3.0)")
+    parser.add_argument("--cfg_mode", type=str, choices=["full", "reference"],
+                        help="what the unconditional branch drops: reference+audio (full) or only the reference "
+                             "(original: full)")
+    parser.add_argument("--ref_cache", type=str, choices=["on", "off"],
+                        help="compute reference UNet features once per frame instead of per window and step "
+                             "(original: per window)")
+    parser.add_argument("--context_overlap", type=int,
+                        help="frames shared by neighbouring 12-frame context windows, default 0 (original: 3)")
     parser.add_argument("--weight_dtype", type=str, choices=["fp16", "bf16", "fp32"], help="override config weight_dtype")
 
 
